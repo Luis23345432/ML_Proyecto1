@@ -2,11 +2,11 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-from collections import Counter
 import h5py
-import random
+from collections import Counter
+from tqdm import tqdm
+from joblib import Parallel, delayed  # Para paralelizar procesos
+from scipy.spatial import KDTree  # Para acelerar KNN
 
 # Función para cargar datos de un archivo HDF5
 def load_hdf5_dataset(file_path, dataset_name=None):
@@ -21,27 +21,29 @@ def load_hdf5_dataset(file_path, dataset_name=None):
 def normalize_data(X):
     return (X - np.mean(X, axis=0)) / np.std(X, axis=0)
 
-# Implementación de KNN optimizado
+# Implementación de KNN optimizado con KD-Tree
 class KNN:
-    def __init__(self, k=5):
+    def __init__(self, k=1):  # Cambiado k a 1
         self.k = k
+        self.tree = None
+        self.y_train = None
 
     def fit(self, X, y):
-        self.X_train = X
+        self.tree = KDTree(X)  # Construcción del KD-Tree
         self.y_train = y
 
     def predict(self, X):
-        predictions = [self._predict_single(x) for x in X]
+        distances, indices = self.tree.query(X, k=self.k)  # Consulta eficiente
+        if self.k == 1:
+            indices = np.expand_dims(indices, axis=-1)  # Aseguramos que sea un array 2D
+        predictions = []
+        for neighbors in indices:
+            k_labels = self.y_train[neighbors]
+            most_common = Counter(k_labels).most_common(1)
+            predictions.append(most_common[0][0])
         return np.array(predictions)
 
-    def _predict_single(self, x):
-        distances = np.linalg.norm(self.X_train - x, axis=1)
-        k_indices = np.argpartition(distances, self.k)[:self.k]
-        k_labels = self.y_train[k_indices]
-        most_common = Counter(k_labels).most_common(1)
-        return most_common[0][0]
-
-# Árbol de decisión (base para Random Forest)
+# Árbol de decisión optimizado
 class DecisionTree:
     def __init__(self, max_depth=10, min_samples_split=2):
         self.max_depth = max_depth
@@ -105,7 +107,7 @@ class DecisionTree:
         else:
             return self._predict_single(x, tree["right"])
 
-# Random Forest optimizado
+# Random Forest optimizado con paralelización
 class RandomForest:
     def __init__(self, n_trees=50, max_depth=12, min_samples_split=5, max_features="sqrt"):
         self.n_trees = n_trees
@@ -114,63 +116,58 @@ class RandomForest:
         self.max_features = max_features
         self.trees = []
 
-    def fit(self, X, y):
-        self.trees = []
+    def _fit_single_tree(self, X, y):
         n_samples, n_features = X.shape
+        indices = np.random.choice(n_samples, n_samples, replace=True)
+        X_sample, y_sample = X[indices], y[indices]
 
-        for _ in tqdm(range(self.n_trees), desc="Entrenando árboles"):
-            indices = np.random.choice(n_samples, n_samples, replace=True)
-            X_sample, y_sample = X[indices], y[indices]
+        if self.max_features == "sqrt":
+            n_selected_features = int(np.sqrt(n_features))
+        elif self.max_features == "log2":
+            n_selected_features = int(np.log2(n_features))
+        else:
+            n_selected_features = n_features
 
-            if self.max_features == "sqrt":
-                n_selected_features = int(np.sqrt(n_features))
-            elif self.max_features == "log2":
-                n_selected_features = int(np.log2(n_features))
-            else:
-                n_selected_features = n_features
+        selected_features = np.random.choice(n_features, n_selected_features, replace=False)
+        tree = DecisionTree(max_depth=self.max_depth, min_samples_split=self.min_samples_split)
+        tree.fit(X_sample[:, selected_features], y_sample)
+        return tree, selected_features
 
-            selected_features = np.random.choice(n_features, n_selected_features, replace=False)
-            tree = DecisionTree(max_depth=self.max_depth, min_samples_split=self.min_samples_split)
-            tree.fit(X_sample[:, selected_features], y_sample)
-            self.trees.append((tree, selected_features))
+    def fit(self, X, y):
+        self.trees = Parallel(n_jobs=-1)(
+            delayed(self._fit_single_tree)(X, y) for _ in tqdm(range(self.n_trees), desc="Entrenando árboles")
+        )
 
     def predict(self, X):
-        tree_predictions = np.array([tree.predict(X[:, features]) for tree, features in self.trees])
+        tree_predictions = np.array([
+            tree.predict(X[:, features]) for tree, features in self.trees
+        ])
         return np.apply_along_axis(lambda x: Counter(x).most_common(1)[0][0], axis=0, arr=tree_predictions)
 
 # Cargar datos
 train_data = load_hdf5_dataset('train.h5')
 test_data = load_hdf5_dataset('test.h5')
 
-X_train = np.hstack([train_data['body_acc_x'], train_data['body_acc_y'], train_data['body_acc_z'],
-                     train_data['body_gyro_x'], train_data['body_gyro_y'], train_data['body_gyro_z'],
-                     train_data['total_acc_x'], train_data['total_acc_y'], train_data['total_acc_z']])
+X_train = np.hstack([
+    train_data['body_acc_x'], train_data['body_acc_y'], train_data['body_acc_z'],
+    train_data['body_gyro_x'], train_data['body_gyro_y'], train_data['body_gyro_z'],
+    train_data['total_acc_x'], train_data['total_acc_y'], train_data['total_acc_z']
+])
 y_train = train_data['y'].astype(int)
-X_test = np.hstack([test_data['body_acc_x'], test_data['body_acc_y'], test_data['body_acc_z'],
-                    test_data['body_gyro_x'], test_data['body_gyro_y'], test_data['body_gyro_z'],
-                    test_data['total_acc_x'], test_data['total_acc_y'], test_data['total_acc_z']])
+X_test = np.hstack([
+    test_data['body_acc_x'], test_data['body_acc_y'], test_data['body_acc_z'],
+    test_data['body_gyro_x'], test_data['body_gyro_y'], test_data['body_gyro_z'],
+    test_data['total_acc_x'], test_data['total_acc_y'], test_data['total_acc_z']
+])
 
 X_train = normalize_data(X_train)
 X_test = normalize_data(X_test)
 
+from sklearn.model_selection import train_test_split
 X_train_split, X_val, y_train_split, y_val = train_test_split(X_train, y_train, test_size=0.3, random_state=42)
 
-# Optimización de KNN
-best_k = None
-best_score = 0
-for k in range(1, 11):
-    knn = KNN(k=k)
-    knn.fit(X_train_split, y_train_split)
-    predictions = knn.predict(X_val)
-    score = accuracy_score(y_val, predictions)
-    if score > best_score:
-        best_score = score
-        best_k = k
-
-print(f"Mejor k para KNN: {best_k} con Accuracy: {best_score}")
-
-# KNN final
-knn = KNN(k=best_k)
+# KNN optimizado
+knn = KNN(k=1)  # Cambiado k a 1
 knn.fit(X_train_split, y_train_split)
 knn_predictions = knn.predict(X_val)
 
@@ -179,27 +176,8 @@ print("Accuracy:", accuracy_score(y_val, knn_predictions))
 print("F1-Score:", f1_score(y_val, knn_predictions, average='weighted'))
 print("Confusion Matrix:\n", confusion_matrix(y_val, knn_predictions))
 
-# Optimización de Random Forest
-best_params = None
-best_rf_score = 0
-for _ in range(10):  # Búsqueda aleatoria con 10 iteraciones
-    params = {
-        "n_trees": random.choice([50, 100, 150]),
-        "max_depth": random.choice([10, 12, 15]),
-        "min_samples_split": random.choice([2, 5, 10]),
-    }
-    rf = RandomForest(**params)
-    rf.fit(X_train_split, y_train_split)
-    predictions = rf.predict(X_val)
-    score = accuracy_score(y_val, predictions)
-    if score > best_rf_score:
-        best_rf_score = score
-        best_params = params
-
-print(f"Mejores parámetros para Random Forest: {best_params} con Accuracy: {best_rf_score}")
-
-# Random Forest final
-rf = RandomForest(**best_params)
+# Random Forest optimizado
+rf = RandomForest(n_trees=50, max_depth=12, min_samples_split=5)
 rf.fit(X_train_split, y_train_split)
 rf_predictions = rf.predict(X_val)
 
@@ -208,7 +186,7 @@ print("Accuracy:", accuracy_score(y_val, rf_predictions))
 print("F1-Score:", f1_score(y_val, rf_predictions, average='weighted'))
 print("Confusion Matrix:\n", confusion_matrix(y_val, rf_predictions))
 
-# Predicciones finales
+# Generar predicciones finales
 final_predictions = rf.predict(X_test)
 submission = pd.DataFrame({
     'ID': np.arange(1, len(final_predictions) + 1),
